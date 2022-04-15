@@ -15,6 +15,7 @@
 #include <seastar/testing/thread_test_case.hh>
 #include "schema_builder.hh"
 #include <seastar/util/closeable.hh>
+#include <seastar/core/loop.hh>
 #include "service/migration_manager.hh"
 
 #include <seastar/core/thread.hh>
@@ -32,6 +33,8 @@
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/simple_schema.hh"
 #include "utils/error_injection.hh"
+#include <seastar/core/reactor.hh>
+#include <cmath>
 
 static api::timestamp_type next_timestamp() {
     static thread_local api::timestamp_type next_timestamp = 1;
@@ -813,5 +816,75 @@ SEASTAR_TEST_CASE(failed_flush_prevents_writes) {
         BOOST_ASSERT(eventually_true([&t]() { return t.active_memtable().empty(); }));
     });
 #endif
+}
+
+logger l("MSI");
+SEASTAR_TEST_CASE(flushing_rate_is_reduced_if_compaction_doesnt_keep_up) {
+    return do_with_cql_env([](cql_test_env& env) -> future<> {
+        struct flusher {
+            cql_test_env& env;
+            const int num_flushes;
+            const int num_mutations_per_flush;
+            const int num_concurrent_flushes;
+            random_mutation_generator& gen;
+            future<> operator()() {
+                replica::database& db = env.local_db();
+                schema_ptr s = gen.schema();
+                const sstring ks_name = s->ks_name();
+                const sstring cf_name = s->cf_name();
+
+                replica::table& t = db.find_column_family(ks_name, cf_name);
+                replica::memtable& m = t.active_memtable();
+
+                size_t max_sstables_count = 0;
+                semaphore sem{num_concurrent_flushes};
+                auto range = boost::irange<int>(0, num_flushes);
+                co_await seastar::parallel_for_each(range.begin(), range.end(), [&](int value) -> future<> {
+                    return with_semaphore(sem, 1, [&] {
+                        std::vector<mutation> mutations = gen(num_mutations_per_flush);
+                        for (auto&& m : mutations) {
+                            t.apply(std::move(m));
+                        }
+                        auto f = t.flush();
+                        max_sstables_count = std::max(t.sstables_count(), max_sstables_count);
+                        return f;
+                    });
+                });
+                l.warn("Max SStables count: {}, current sstables count: {}, thread: {}", max_sstables_count, t.sstables_count(), this_shard_id());
+                co_await t.await_pending_ops();
+            }
+        };
+        auto create_table = [] (cql_test_env& env, schema_ptr s) -> future<> {
+            const sstring ks_name = s->ks_name();
+            const sstring cf_name = s->cf_name();
+            service::migration_manager& mm = env.migration_manager().local();
+            auto group0_guard = co_await mm.start_group0_operation();
+            auto ts = group0_guard.write_timestamp();
+            auto announcement = co_await mm.prepare_new_column_family_announcement(s, ts);
+            co_await mm.announce(std::move(announcement), std::move(group0_guard));
+        };
+
+        replica::database& db = env.local_db();
+        std::vector<lw_shared_ptr<random_mutation_generator>> generators;
+        const unsigned thread_count = 2;
+        for (unsigned thread_id : boost::irange<unsigned>(0, thread_count)) {
+            auto cf_name = format("cf_{}", thread_id);
+            generators.push_back(make_lw_shared<random_mutation_generator>(random_mutation_generator::generate_counters::no, local_shard_only::yes, random_mutation_generator::generate_uncompactable::no, std::nullopt, "ks", cf_name.c_str()));
+        }
+        for (unsigned thread_id : boost::irange<unsigned>(0, thread_count)) {
+            co_await create_table(env, generators[thread_id]->schema());
+        }
+
+        std::vector<unsigned> concurrent_flushes{2, 10};
+        std::vector<unsigned> mutations_per_flush{1, 200};
+        std::vector<unsigned> num_flushes{500, 10};
+        std::vector<future<>> futures;
+        for (unsigned thread_id : boost::irange<unsigned>(0, thread_count)) {
+            futures.push_back(smp::submit_to(thread_id, flusher{.env=env, .num_flushes=num_flushes[thread_id], .num_mutations_per_flush=mutations_per_flush[thread_id], .num_concurrent_flushes=concurrent_flushes[thread_id], .gen=*generators[thread_id]}));
+        }
+        for (auto&& f : futures) {
+            co_await std::move(f);
+        }
+    });
 }
 
