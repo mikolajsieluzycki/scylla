@@ -879,7 +879,12 @@ protected:
             std::exception_ptr ex;
 
             try {
-                co_await compact_sstables_and_update_history(std::move(descriptor), _compaction_data, std::move(release_exhausted));
+                auto ct = descriptor.options.type();
+                sstables::compaction_result res = co_await compact_sstables(std::move(descriptor), _compaction_data, std::move(release_exhausted));
+                if (should_update_history(res, ct)) {
+                    replica::table& t = *_compacting_table;
+                    co_await update_history(t.as_table_state(), _compaction_data.compaction_uuid, t.schema()->ks_name(), t.schema()->cf_name(), std::move(res));
+                }
                 finish_compaction();
                 _cm.reevaluate_postponed_compactions();
                 continue;
