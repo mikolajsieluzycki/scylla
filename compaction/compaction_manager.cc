@@ -881,6 +881,13 @@ protected:
             try {
                 auto ct = descriptor.options.type();
                 sstables::compaction_result res = co_await compact_sstables(std::move(descriptor), _compaction_data, std::move(release_exhausted));
+                {
+                    // update_history can take a long time compared to compaction.
+                    // There is no need to wait with next compaction until history
+                    // is updated, so release the weight earlier to remove unnecessary
+                    // serialization.
+                    compaction_weight_registration r = std::move(weight_r);
+                }
                 if (should_update_history(res, ct)) {
                     replica::table& t = *_compacting_table;
                     co_await update_history(t.as_table_state(), _compaction_data.compaction_uuid, t.schema()->ks_name(), t.schema()->cf_name(), std::move(res));
