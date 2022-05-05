@@ -130,6 +130,9 @@ public:
 
     protected:
         virtual future<> do_run() = 0;
+        bool should_update_history(const sstables::compaction_result& res, sstables::compaction_type ct) const noexcept {
+            return res.valid() && ct == sstables::compaction_type::Compaction;
+        }
 
         using throw_if_stopping = bool_class<struct throw_if_stopping_tag>;
 
@@ -149,8 +152,11 @@ public:
 
         // Compacts set of SSTables according to the descriptor.
         using release_exhausted_func_t = std::function<void(const std::vector<sstables::shared_sstable>& exhausted_sstables)>;
-        future<> compact_sstables(sstables::compaction_descriptor descriptor, sstables::compaction_data& cdata, release_exhausted_func_t release_exhausted,
+        future<> compact_sstables_and_update_history(sstables::compaction_descriptor descriptor, sstables::compaction_data& cdata, release_exhausted_func_t release_exhausted,
                                   can_purge_tombstones can_purge = can_purge_tombstones::yes);
+        future<sstables::compaction_result> compact_sstables(sstables::compaction_descriptor descriptor, sstables::compaction_data& cdata, release_exhausted_func_t release_exhausted,
+                                  can_purge_tombstones can_purge = can_purge_tombstones::yes);
+        future<> update_history(compaction::table_state& table_state, utils::UUID compaction_id, sstring ks_name, sstring cf_name, sstables::compaction_result res);
     public:
         future<> run() noexcept;
 
