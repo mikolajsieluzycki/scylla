@@ -88,7 +88,9 @@ struct compaction_data {
 struct compaction_result {
     std::vector<sstables::shared_sstable> new_sstables;
     std::chrono::time_point<db_clock> ended_at;
+    uint64_t start_size = 0;
     uint64_t end_size = 0;
+    bool valid() const noexcept { return ended_at != std::chrono::time_point<db_clock>{}; }
 };
 
 // Compact a list of N sstables into M sstables.
