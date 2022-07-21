@@ -14,6 +14,10 @@
 template<typename T>
 concept RangeTombstoneChangeConsumer = std::invocable<T, range_tombstone_change>;
 
+#ifdef DEBUG_ASSERT
+extern logging::logger mrlog;
+#endif
+
 /// Generates range_tombstone_change fragments for a stream of range_tombstone fragments.
 ///
 /// The input range_tombstones passed to consume() may be overlapping, but must be weakly ordered by position().
@@ -78,6 +82,7 @@ public:
     template<RangeTombstoneChangeConsumer C>
     void flush(const position_in_partition_view upper_bound, C consumer, bool end_of_range = false) {
         if (_range_tombstones.empty()) {
+            _lower_bound = upper_bound;
             return;
         }
 
@@ -136,10 +141,23 @@ public:
             consumer(range_tombstone_change(upper_bound, tombstone()));
         }
 
+#ifdef DEBUG_ASSERT
+        if(cmp(_lower_bound, upper_bound) >= 0) {
+            on_internal_error_noexcept(mrlog, format("lower_bound: {} >=\nupper_bound: {}", _lower_bound, upper_bound));
+            abort();
+        }
+#endif
         _lower_bound = upper_bound;
     }
 
     void consume(range_tombstone rt) {
+#ifdef DDEBUG_ASSERT
+        position_in_partition::tri_compare cmp(_schema);
+        if(cmp(_lower_bound, rt.position()) >= 0) {
+            on_internal_error_noexcept(mrlog, format("lower_bound: {} >=\nrange_tombstone position: {}", _lower_bound, rt.position()));
+            abort();
+        }
+#endif
         _range_tombstones.apply(_schema, std::move(rt));
     }
 
