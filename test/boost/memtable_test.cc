@@ -1004,3 +1004,109 @@ SEASTAR_TEST_CASE(failed_flush_prevents_writes) {
     });
 #endif
 }
+
+class mutation_fragment_order_check_consumer {
+    schema_ptr _schema;
+    mutation_fragment_stream_validator _validator;
+    reader_permit _permit;
+public:
+    mutation_fragment_order_check_consumer(schema_ptr s, reader_permit permit) : _schema(s), _validator(*_schema), _permit(permit) { }
+
+    void consume_new_partition(const dht::decorated_key& dk) {
+        BOOST_REQUIRE(_validator(mutation_fragment_v2::kind::partition_start));
+    }
+    stop_iteration consume(tombstone t) {
+        return stop_iteration::no;
+    }
+    stop_iteration consume(range_tombstone_change&& rt) {
+        BOOST_REQUIRE(_validator(mutation_fragment_v2(*_schema, _permit, std::move(rt))));
+        return stop_iteration::no;
+    }
+    stop_iteration consume(static_row&& sr) {
+        BOOST_REQUIRE(_validator(mutation_fragment_v2(*_schema, _permit, std::move(sr))));
+        return stop_iteration::no;
+    }
+    stop_iteration consume(clustering_row&& cr) {
+        BOOST_REQUIRE(_validator(mutation_fragment_v2(*_schema, _permit, std::move(cr))));
+        return stop_iteration::no;
+    }
+    stop_iteration consume_end_of_partition() {
+        BOOST_REQUIRE(_validator(mutation_fragment_v2::kind::partition_end));
+        return stop_iteration::no;
+    }
+    mutation_opt consume_end_of_stream() {
+        _validator.on_end_of_stream();
+        return {};
+    }
+};
+
+
+SEASTAR_TEST_CASE(mutation_is_consumed_in_monotonic_order_basic) {
+    return seastar::async([] {
+        tests::reader_concurrency_semaphore_wrapper semaphore;
+        schema_ptr s = schema_builder{"ks", "cf"}
+            .with_column("pk", bytes_type, column_kind::partition_key)
+            .with_column("ck1", bytes_type, column_kind::clustering_key)
+            .build();
+
+        clustering_key ck_e{std::vector<bytes>{}};
+        clustering_key ck_0{{serialized((int32_t)0)}};
+        clustering_key ck_1{{serialized((int32_t)1)}};
+        clustering_key ck_2{{serialized((int32_t)2)}};
+        clustering_key ck_3{{serialized((int32_t)3)}};
+        mutation m{s, dht::decorate_key(*s, partition_key{{"pk"}})};
+        reader_permit p = semaphore.make_permit();
+        api::timestamp_type ts = api::min_timestamp;
+        gc_clock::time_point tp{};
+        m.partition().apply(tombstone{api::min_timestamp + 2, gc_clock::time_point{}});
+        range_tombstone rt1{ck_e, bound_kind::incl_start, ck_1, bound_kind::incl_end, tombstone{ts + 0, tp}};
+        range_tombstone rt2{ck_1, bound_kind::excl_start, ck_e, bound_kind::incl_end, tombstone{ts + 1, tp}};
+        clustering_row cr1{*s, rows_entry{*s, position_in_partition{partition_region::clustered, bound_weight::equal, ck_0}, is_dummy::no, is_continuous::no}};
+        clustering_row cr2{*s, rows_entry{*s, position_in_partition{partition_region::clustered, bound_weight::equal, ck_2}, is_dummy::no, is_continuous::no}};
+        clustering_row cr3{*s, rows_entry{*s, position_in_partition{partition_region::clustered, bound_weight::equal, ck_3}, is_dummy::no, is_continuous::no}};
+        m.apply(mutation_fragment(*s, p, std::move(rt1)));
+        m.apply(mutation_fragment(*s, p, std::move(rt2)));
+        m.apply(mutation_fragment(*s, p, std::move(cr1)));
+        m.apply(mutation_fragment(*s, p, std::move(cr2)));
+        m.apply(mutation_fragment(*s, p, std::move(cr3)));
+        m.partition().ensure_last_dummy(*s);
+        mutation m1{m};
+        mutation m2{m};
+        {
+            schema_ptr reverse_schema = s->make_reversed();
+            mutation_fragment_order_check_consumer consumer{reverse_schema, semaphore.make_permit()};
+            std::move(m).consume(consumer, consume_in_reverse::yes);
+        }
+        {
+            mutation_fragment_order_check_consumer consumer{s, semaphore.make_permit()};
+            std::move(m1).consume(consumer, consume_in_reverse::no);
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(mutation_is_consumed_in_monotonic_order) {
+    return seastar::async([] {
+        tests::reader_concurrency_semaphore_wrapper semaphore;
+        random_mutation_generator gen{random_mutation_generator::generate_counters::no};
+        schema_ptr s = gen.schema();
+        schema_ptr reverse_schema = s->make_reversed();
+        for (int i : boost::irange<int>(1)) {
+            mutation mut = gen();
+            mutation copy{mut};
+            {
+                mutation_fragment_order_check_consumer consumer{reverse_schema, semaphore.make_permit()};
+                std::move(mut).consume(consumer, consume_in_reverse::yes);
+            }
+            {
+                mutation_fragment_order_check_consumer consumer{s, semaphore.make_permit()};
+                std::move(copy).consume(consumer, consume_in_reverse::no);
+            }
+        }
+    });
+}
+/*
+Unexpected mutation fragment:
+partition key {key: pk{0002706b}, token:2164857758319874285}:
+previous partition end:{position: partition_end,null,0},
+current range tombstone change:{position: clustered,ckp{},-1}, at: 0x3134f4e 0x31354f0 0x3135808 0x301deea 0x1183393 0x1183690 0x11837e3 0xe9067c 0xe5f195 0xe8e517 0xe5d786 0xe5c13c 0x3087e56
+*/
